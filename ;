@@ -1,3 +1,5 @@
+from geoopt.manifolds import Euclidean, Sphere
+import geopandas
 import numpy as np
 import torch
 from torchvision import transforms
@@ -5,8 +7,11 @@ from torchdiffeq import odeint
 from typing import List, Tuple, Union
 from tqdm import trange, tqdm
 import os
+import math
 import argparse
-from cleanfid import fid
+# from cleanfid import fid
+from shapely.geometry import Point
+from sklearn.model_selection import train_test_split
 import sys
 
 import matplotlib
@@ -18,6 +23,34 @@ from models import UNetModel
 from models.path import Path
 
 sys.setrecursionlimit(1500)
+
+
+
+class ManifoldDataset(torch.utils.data.Dataset):
+    def __init__(self, coords):
+        self.coords = torch.tensor(coords, dtype=torch.float32)
+
+    def __len__(self):
+        return len(self.coords)
+
+    def __getitem__(self, idx):
+        return self.coords[idx]
+
+
+class MoonDataset(torch.utils.data.Dataset):
+    def __init__(self, x, y):
+        self.x = torch.tensor(x, dtype=torch.float32)
+        self.y = torch.tensor(y, dtype=torch.long)
+    
+    def __len__(self):
+        return min(len(self.x), len(self.y))
+
+    def __getitem__(self, idx):
+        return self.x[idx], self.y[idx]
+
+
+def deg_to_rad(lat, lon):
+    return lat * 180.0 / math.pi, lon * 180.0 / math.pi, 
 
 
 def train(
@@ -32,11 +65,13 @@ def train(
         path,
         scheduler_type,
         progress_bar,
+        geom,
         grad_clip: int = 1.0,
 ):
     """
     TIPS: 
-    - decreasing LR may improve the model; oscillation around local minima induces a higher average training error.
+    - decreasing LR may improve the model
+    - oscillation around local minima induces a higher average training error
     - if a model seems to be unable to capture the data fully, increase the number of parameters and try a lower LR. 
     """
 
@@ -60,25 +95,36 @@ def train(
             total_loss = 0
 
             with tqdm(train_loader, dynamic_ncols=True) as batch_pbar:
-            # train_loader = tqdm(, desc=, position=0, leave=True)
-
                 for i, batch in enumerate(batch_pbar):
                     # sample training data ~ p_1(x_1)
-                    x_1, _ = batch
+                    if isinstance(batch, tuple) or isinstance(batch, list):
+                        x_1, _ = batch
+                    else:
+                        x_1 = batch
+
                     x_1 = x_1.to(device)
 
                     # t ~ U[0, 1]
                     t = torch.rand(size=(len(x_1), 1), device=device)
                     
                     # x_{0} ~ p_{0}(x_{0}; 0, I)
-                    x_0 = torch.randn_like(x_1, device=device)
+                    # Sample noise on manifold
+                    if geom is not None and isinstance(geom, Sphere):
+                        x_0 = geom.random_uniform(*x_1.shape,
+                                                  dtype=x_1.dtype,
+                                                  device=device)
+                    else:
+                        x_0 = torch.randn_like(x_1, device=device)
 
                     # x_{t} ~ p_{t}(x_{t}; tx_{1}, (1 - (1 - \sigma_{\min})*t)I)
-                    x_t, u_t = path.sample_path(x_0=x_0, x_1=x_1, t=t)
+                    x_t, u_t = path.sample_path(x_0=x_0, x_1=x_1, t=t, geom=geom)
                     
                     optimizer.zero_grad()
 
-                    loss = torch.pow(model([x_t, t]) - u_t, 2).mean()
+                    # Project v_t to tangent space
+                    v_t = geom.proju(x_t, model([x_t, t]))
+
+                    loss = torch.pow(v_t - u_t, 2).mean()
 
                     loss.backward()
 
@@ -88,11 +134,9 @@ def train(
 
                     total_loss += loss.detach().cpu().item()
 
-                    # if i % display_train_freq == display_train_freq - 1:
 
                 avg_loss = total_loss / len(train_loader)
                 # record average loss per display_train_freq batches
-                # avg_loss = total_loss / display_train_freq
                 agg_train_loss.append(avg_loss)
 
                 print(f'\nBatch {i + 1}/{len(train_loader)}\tTrain Loss: {avg_loss:.3e}')
@@ -100,7 +144,11 @@ def train(
                 if epoch % display_val_freq == 0:
                     with torch.no_grad():
                         for val_batch in val_loader:
-                            x_1, _ = val_batch
+                            if isinstance(val_batch, tuple) or isinstance(val_batch, list):
+                                x_1, _ = val_batch
+                            else:
+                                x_1 = val_batch
+
                             x_1 = x_1.to(device)
 
                             if len(x_1) != batch_size:
@@ -109,9 +157,11 @@ def train(
                             x_0 = torch.randn_like(x_1).to(device)
                             t = torch.rand(size=(len(x_1), 1), device=device)
 
-                            x_t, u_t = path.sample_path(x_0=x_0, x_1=x_1, t=t)
+                            x_t, u_t = path.sample_path(x_0=x_0, x_1=x_1, t=t,
+                                                        geom=geom)
+                            v_t = geom.proju(x_t, model([x_t, t]))
 
-                            val_loss = torch.pow(model([x_t, t]) - u_t, 2).mean()
+                            val_loss = torch.pow(v_t - u_t, 2).mean()
                             total_val_loss += val_loss.detach().cpu().item()
                     
                     avg_val_loss = total_val_loss / len(val_loader)
@@ -139,27 +189,35 @@ def sample(
         device: torch.device,
         num_samples: int = 1,
         display_plot: str = 'img',
+        geom=None,
     ):
 
     def ode_func(t, x):
         if t.dim() <= 1:
             t = t.unsqueeze(-1)
-        return model([x, t])
-
-    if display_plot:
-        _, axs = plt.subplots(num_samples, n_steps, figsize=(30, 4), sharex=True, sharey=True)
-    else:
-        _, axs = plt.subplots(1, num_samples, figsize=(30, 4), sharex=True, sharey=True)
+        v_t = model([x, t])
+        if geom is not None:
+            # Project v_t onto tangent space
+            v_t = geom.proju(x, v_t)
+        return v_t
 
     with torch.no_grad():
         for s in range(num_samples):
             # size: B x C x H x W
-            x_0 = torch.randn(size=(1, num_channels, *size), device=device)
+            if geom is not None and isinstance(geom, Sphere):
+                x_0 = geom.random_uniform(1, num_channels, *size,
+                                          device=device)
+            else:
+                x_0 = torch.randn(size=(1, num_channels, *size), device=device)
+
             time_traj = torch.linspace(0, 1, n_steps, device=device)
 
             sol = odeint(func=ode_func, y0=x_0, t=time_traj, method=ode_method)
 
             if display_plot == 'img':
+                _, axs = plt.subplots(num_samples, n_steps, figsize=(30, 4), sharex=True, sharey=True)
+                    # _, axs = plt.subplots(1, num_samples, figsize=(30, 4), sharex=True, sharey=True)
+
                 sol = (sol - sol.min()) / (sol.max() - sol.min())
                 for i in range(n_steps):
                     # size: n_steps x B x C x H x W, always take n_samples
@@ -174,14 +232,61 @@ def sample(
                     c_ax.set_title(f't: {time_traj[i]:.2f}')
             elif display_plot == '2d':
                 # x_{0} ~ p_{x_{0}}(x_{0} | 0, I)
-                axs[0].set_xlim(-3.0, 3.0)
-                axs[0].set_ylim(-3.0, 3.0)
+                n_cols = math.ceil(math.sqrt(n_steps))
+                n_rows = math.ceil(n_steps / n_cols)
+                fig, axs = plt.subplots(n_rows, n_cols, figsize=(n_cols * 3,
+                                                                 n_rows * 3))
+                axs = axs.flatten() if n_steps > 1 else [axs]
 
                 for i in range(n_steps):
                     c_ax = axs[i]
-                    c_ax.scatter(sol[i, :, :, :, 0].numpy(), sol[i, :, :, :, 1].numpy(), s=10)
+                    c_ax.set_xlim(-3.0, 3.0)
+                    c_ax.set_ylim(-3.0, 3.0)
+                    c_ax.scatter(sol[i, :, :, :, 0].cpu().numpy(), sol[i, :, :, :, 1].cpu().numpy(), s=10)
                     c_ax.set_aspect('equal')
                     c_ax.set_title(f't: {time_traj[i]:.2f}')
+            elif display_plot == 'world':
+                n_cols = math.ceil(math.sqrt(n_steps))
+                n_rows = math.ceil(n_steps / n_cols)
+                fig, axs = plt.subplots(n_rows, n_cols, figsize=(n_cols * 3,
+                                                                 n_rows * 3))
+                axs = axs.flatten() if n_steps > 1 else [axs]
+
+                # Plot on world
+                world = geopandas.read_file(geopandas.datasets.get_path(
+                    'naturalearth_lowres'))
+
+                for i in range(n_steps):
+                    c_ax = axs[i]
+                    c_ax.set_xlim(-3.0, 3.0)
+                    c_ax.set_ylim(-3.0, 3.0)
+
+                    world.plot(ax=c_ax, color='lightgrey', edgecolor='black')
+
+                    pts = sol[i, 0, 0].cpu()
+                    x = pts[:, 0]
+                    y = pts[:, 1]
+                    z = pts[:, 2]
+
+                    # Unit sphere has radius 1
+                    lat = torch.asin(z)
+                    lat = 180.0 * lat / math.pi
+                    lon = torch.atan2(y, x)
+                    lon = 180.0 * lon / math.pi
+
+                    lat = lat.reshape(-1)
+                    lon = lon.reshape(-1)
+
+                    # Assume same size
+                    geometry = [Point(lon[k], lat[k]) for k in range(len(lon))]
+                    gdf = geopandas.GeoDataFrame(geometry=geometry)
+
+                    gdf.plot(ax=c_ax, color='red', markersize=3)
+                    c_ax.set_aspect('equal')
+                    c_ax.set_title(f't: {time_traj[i]:.2f}')
+                    c_ax.set_xlim([-180, 180])
+                    c_ax.set_ylim([-90, 90])
+                
             else:
                 sol = sol.detach().cpu()
                 sol = (sol - sol.min()) / (sol.max() - sol.min())
@@ -190,6 +295,8 @@ def sample(
                 axs[s].axis('off')
                 axs[s].set_title(f't: {time_traj[-1]:.2f}')
 
+        for j in range(n_steps, len(axs)):
+            axs[j].axis('off')
         plt.tight_layout()
         plt.show()
 
@@ -200,7 +307,8 @@ if __name__ == '__main__':
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     parser = argparse.ArgumentParser()
-    parser.add_argument('-c', '--config', help='Path to config file', default='./config/config.json')
+    parser.add_argument('-c', '--config', help='Path to config file',
+                        default='./config/rfm_config.json')
     args = parser.parse_args()
 
     config = load_config(args.config)
@@ -230,6 +338,7 @@ if __name__ == '__main__':
     path_type = dataset_config['path_type']
     progress_bar = dataset_config['progress_bar']
     display_plot = dataset_config['display_plot']
+    manifold = dataset_config['manifold']
     
     # model-related params
     model_config = dataset_config["model_config"]
@@ -290,24 +399,12 @@ if __name__ == '__main__':
 
     elif dataset_type == 'moons':
         from sklearn.datasets import make_moons
-        from sklearn.model_selection import train_test_split
 
         num_points = 100_000
         num_sample_points = 128
         dataset = make_moons(num_points, noise=0.05)
         x_train, x_test, y_train, y_test = train_test_split(dataset[0], dataset[1], test_size=0.2, random_state=42)
         x_train, x_val, y_train, y_val = train_test_split(x_train, y_train, test_size=0.2, random_state=42)
-
-        class MoonDataset(torch.utils.data.Dataset):
-            def __init__(self, x, y):
-                self.x = torch.tensor(x, dtype=torch.float32)
-                self.y = torch.tensor(y, dtype=torch.long)
-            
-            def __len__(self):
-                return min(len(self.x), len(self.y))
-        
-            def __getitem__(self, idx):
-                return self.x[idx], self.y[idx]
         
         train_set = MoonDataset(x_train, y_train)
         val_set = MoonDataset(x_val, y_val)
@@ -318,6 +415,50 @@ if __name__ == '__main__':
         # sampling
         size = (num_sample_points, in_dim)
         rgb_channels = 1
+    elif dataset_type == 'volcanoes':
+        import json
+
+        dataset_dir = os.path.join(os.getcwd(), 'data/volcanoes')
+
+        points = []
+
+        for root, dir, files in os.walk(dataset_dir):
+            for file in files:
+                with open(os.path.join(root, file), 'r') as f:
+                    data = json.load(f)
+
+                for volcano in data.get('items'):
+                    lat = volcano.get('latitude')
+                    lon = volcano.get('longitude')
+
+                    x = np.cos(lat) * np.cos(lon)
+                    y = np.cos(lat) * np.sin(lon)
+                    z = np.sin(lat)
+                    xyz = np.stack([x, y, z], axis=-1)
+                    points.append(xyz)
+        
+        points = np.array(points)
+        # Normalize to unit Sphere
+        points = points / np.linalg.norm(points, axis=-1, keepdims=True)
+        dataset = ManifoldDataset(points)
+        
+        indices = np.arange(len(points))
+        train_idx, test_idx = train_test_split(indices, test_size=0.2, random_state=42)
+        train_idx, val_idx = train_test_split(train_idx, test_size=0.2, random_state=42)
+
+        from torch.utils.data import Subset
+
+        train_set = Subset(dataset, train_idx)
+        val_set = Subset(dataset, val_idx)
+        test_set= Subset(dataset, test_idx)
+
+        num_sample_points = 128
+        in_dim = points.shape[-1]
+        rgb_channels = 1
+        size = (num_sample_points, points.shape[-1])
+
+    elif dataset_type == 'earthquake':
+        pass
 
     if model_type == 'mlp':
         model = MLP(
@@ -340,6 +481,11 @@ if __name__ == '__main__':
             dropout=dropout,
             class_cond=False,
         ).to(device)
+
+    geom = {
+            "Sphere": Sphere(),
+            "Euclidean": Euclidean(),
+    }.get(manifold)
 
     if training:
         # reset model checkpoint
@@ -369,6 +515,7 @@ if __name__ == '__main__':
             path=path,
             scheduler_type=scheduler_type,
             progress_bar=progress_bar,
+            geom=geom
         )
 
         torch.save(model.state_dict(), model_path)
@@ -385,7 +532,7 @@ if __name__ == '__main__':
         device=device,
         num_samples=num_samples,
         display_plot=display_plot,
+        geom=geom
     )
 
-    # score = fid.compute_fid(gen=sample, dataset_name='cifar10', dataset_res=img_reshape_size[0], batch_size=1024, model_name="clip_vit_b_32")
-    # print(f"FID: {score}")
+
